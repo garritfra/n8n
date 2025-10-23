@@ -8,6 +8,7 @@ import {
 	WorkflowTagMappingRepository,
 	SharedWorkflowRepository,
 	WorkflowRepository,
+	WorkflowHistoryRepository,
 } from '@n8n/db';
 import { Service } from '@n8n/di';
 import type { Scope } from '@n8n/permissions';
@@ -19,6 +20,7 @@ import type { QueryDeepPartialEntity } from '@n8n/typeorm/query-builder/QueryPar
 import omit from 'lodash/omit';
 import pick from 'lodash/pick';
 import { BinaryDataService } from 'n8n-core';
+import type { IWorkflowBase } from 'n8n-workflow';
 import { NodeApiError, PROJECT_ROOT } from 'n8n-workflow';
 import { v4 as uuid } from 'uuid';
 
@@ -53,6 +55,7 @@ export class WorkflowService {
 		private readonly ownershipService: OwnershipService,
 		private readonly tagService: TagService,
 		private readonly workflowHistoryService: WorkflowHistoryService,
+		private readonly workflowHistoryRepository: WorkflowHistoryRepository,
 		private readonly externalHooks: ExternalHooks,
 		private readonly activeWorkflowManager: ActiveWorkflowManager,
 		private readonly roleService: RoleService,
@@ -376,16 +379,30 @@ export class WorkflowService {
 			});
 		}
 
+		// TODO: Once autosave is introduced, all the activation logic should be removed.
 		if (updatedWorkflow.active) {
 			// When the workflow is supposed to be active add it again
 			try {
 				await this.externalHooks.run('workflow.activate', [updatedWorkflow]);
-				await this.activeWorkflowManager.add(workflowId, workflow.active ? 'update' : 'activate');
+
+				// If activating for the first time, set activeVersionId in DB
+				if (isNowActive && !wasActive) {
+					await this.workflowRepository.update(workflowId, {
+						activeVersionId: updatedWorkflow.versionId,
+					});
+				}
+
+				await this.activeWorkflowManager.add(
+					workflowId,
+					workflow.active ? 'update' : 'activate',
+					updatedWorkflow,
+				);
 			} catch (error) {
 				// If workflow could not be activated set it again to inactive
 				// and revert the versionId change so UI remains consistent
 				await this.workflowRepository.update(workflowId, {
 					active: false,
+					activeVersionId: null,
 					versionId: workflow.versionId,
 				});
 
@@ -606,5 +623,38 @@ export class WorkflowService {
 			resourceType: 'workflow',
 			...workflow,
 		}));
+	}
+
+	/**
+	 * Gets the active version of a workflow
+	 * Falls back to current version if active version not found
+	 */
+	async getActiveVersion(workflow: IWorkflowBase): Promise<IWorkflowBase> {
+		if (!workflow.activeVersionId) {
+			return workflow;
+		}
+
+		if (workflow.activeVersionId === workflow.versionId) {
+			return workflow;
+		}
+
+		try {
+			const activeVersion = await this.workflowHistoryRepository.findOne({
+				where: { versionId: workflow.activeVersionId },
+				select: ['nodes', 'connections'],
+			});
+
+			if (activeVersion) {
+				return {
+					...workflow,
+					nodes: activeVersion.nodes,
+					connections: activeVersion.connections,
+				};
+			}
+		} catch (error) {
+			// Fall through to use current
+		}
+
+		return workflow;
 	}
 }

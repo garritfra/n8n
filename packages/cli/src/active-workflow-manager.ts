@@ -58,6 +58,7 @@ import * as WorkflowExecuteAdditionalData from '@/workflow-execute-additional-da
 import { WorkflowExecutionService } from '@/workflows/workflow-execution.service';
 import { WorkflowStaticDataService } from '@/workflows/workflow-static-data.service';
 import { formatWorkflow } from '@/workflows/workflow.formatter';
+import { WorkflowService } from '@/workflows/workflow.service';
 
 interface QueuedActivation {
 	activationMode: WorkflowActivateMode;
@@ -88,6 +89,7 @@ export class ActiveWorkflowManager {
 		private readonly publisher: Publisher,
 		private readonly workflowsConfig: WorkflowsConfig,
 		private readonly push: Push,
+		private readonly workflowService: WorkflowService,
 	) {
 		this.logger = this.logger.scoped(['workflow-activation']);
 	}
@@ -246,13 +248,16 @@ export class ActiveWorkflowManager {
 	 * deregister those webhooks from external services.
 	 */
 	async clearWebhooks(workflowId: WorkflowId) {
-		const workflowData = await this.workflowRepository.findOne({
+		const dbWorkflow = await this.workflowRepository.findOne({
 			where: { id: workflowId },
 		});
 
-		if (workflowData === null) {
+		if (dbWorkflow === null) {
 			throw new UnexpectedError('Could not find workflow', { extra: { workflowId } });
 		}
+
+		// Resolve active version
+		const workflowData = await this.workflowService.getActiveVersion(dbWorkflow);
 
 		const workflow = new Workflow({
 			id: workflowId,
@@ -541,7 +546,7 @@ export class ActiveWorkflowManager {
 		workflowId: WorkflowId,
 		activationMode: WorkflowActivateMode,
 		existingWorkflow?: WorkflowEntity,
-		{ shouldPublish } = { shouldPublish: true },
+		{ shouldPublish = true }: { shouldPublish?: boolean } = {},
 	) {
 		const added = { webhooks: false, triggersAndPollers: false };
 
@@ -577,11 +582,14 @@ export class ActiveWorkflowManager {
 				return added;
 			}
 
+			// Resolve active version from database
+			const activeVersion = await this.workflowService.getActiveVersion(dbWorkflow);
+
 			workflow = new Workflow({
 				id: dbWorkflow.id,
 				name: dbWorkflow.name,
-				nodes: dbWorkflow.nodes,
-				connections: dbWorkflow.connections,
+				nodes: activeVersion.nodes,
+				connections: activeVersion.connections,
 				active: dbWorkflow.active,
 				nodeTypes: this.nodeTypes,
 				staticData: dbWorkflow.staticData,
@@ -715,7 +723,7 @@ export class ActiveWorkflowManager {
 				continue;
 			}
 
-			if (ignoreNodeTypes !== undefined && ignoreNodeTypes.includes(node.type)) {
+			if (ignoreNodeTypes?.includes(node.type)) {
 				continue;
 			}
 
@@ -923,7 +931,7 @@ export class ActiveWorkflowManager {
 	 * Register as active in memory a trigger- or poller-based workflow.
 	 */
 	async addTriggersAndPollers(
-		dbWorkflow: WorkflowEntity,
+		dbWorkflow: IWorkflowDb,
 		workflow: Workflow,
 		{
 			activationMode,
@@ -935,15 +943,22 @@ export class ActiveWorkflowManager {
 			additionalData: IWorkflowExecuteAdditionalData;
 		},
 	) {
+		// Create workflow data with active version nodes/connections
+		const workflowData: IWorkflowDb = {
+			...dbWorkflow,
+			nodes: Object.values(workflow.nodes),
+			connections: workflow.connectionsBySourceNode,
+		};
+
 		const getTriggerFunctions = this.getExecuteTriggerFunctions(
-			dbWorkflow,
+			workflowData,
 			additionalData,
 			executionMode,
 			activationMode,
 		);
 
 		const getPollFunctions = this.getExecutePollFunctions(
-			dbWorkflow,
+			workflowData,
 			additionalData,
 			executionMode,
 			activationMode,
@@ -963,7 +978,7 @@ export class ActiveWorkflowManager {
 			getPollFunctions,
 		);
 
-		this.logger.debug(`Added triggers and pollers for workflow ${formatWorkflow(dbWorkflow)}`);
+		this.logger.debug(`Added triggers and pollers for workflow ${formatWorkflow(workflowData)}`);
 
 		return true;
 	}

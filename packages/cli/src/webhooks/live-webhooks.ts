@@ -21,6 +21,7 @@ import * as WebhookHelpers from '@/webhooks/webhook-helpers';
 import { WebhookService } from '@/webhooks/webhook.service';
 import * as WorkflowExecuteAdditionalData from '@/workflow-execute-additional-data';
 import { WorkflowStaticDataService } from '@/workflows/workflow-static-data.service';
+import { WorkflowService } from '@/workflows/workflow.service';
 
 /**
  * Service for handling the execution of live webhooks, i.e. webhooks
@@ -35,6 +36,7 @@ export class LiveWebhooks implements IWebhookManager {
 		private readonly webhookService: WebhookService,
 		private readonly workflowRepository: WorkflowRepository,
 		private readonly workflowStaticDataService: WorkflowStaticDataService,
+		private readonly workflowService: WorkflowService,
 	) {}
 
 	async getWebhookMethods(path: string) {
@@ -44,16 +46,22 @@ export class LiveWebhooks implements IWebhookManager {
 	async findAccessControlOptions(path: string, httpMethod: IHttpRequestMethods) {
 		const webhook = await this.findWebhook(path, httpMethod);
 
-		const workflowData = await this.workflowRepository.findOne({
+		const dbWorkflow = await this.workflowRepository.findOne({
 			where: { id: webhook.workflowId },
-			select: ['nodes'],
 		});
+
+		if (!dbWorkflow) {
+			return undefined;
+		}
+
+		// Resolve active version to get the correct webhook node configuration
+		const workflowData = await this.workflowService.getActiveVersion(dbWorkflow);
 
 		const isChatWebhookNode = (type: string, webhookId?: string) =>
 			type === CHAT_TRIGGER_NODE_TYPE && `${webhookId}/chat` === path;
 
-		const nodes = workflowData?.nodes;
-		const webhookNode = nodes?.find(
+		const nodes = workflowData.nodes;
+		const webhookNode = nodes.find(
 			({ type, parameters, typeVersion, webhookId }) =>
 				(parameters?.path === path &&
 					(parameters?.httpMethod ?? 'GET') === httpMethod &&
@@ -94,14 +102,17 @@ export class LiveWebhooks implements IWebhookManager {
 			});
 		}
 
-		const workflowData = await this.workflowRepository.findOne({
+		const dbWorkflow = await this.workflowRepository.findOne({
 			where: { id: webhook.workflowId },
 			relations: { shared: { project: { projectRelations: true } } },
 		});
 
-		if (workflowData === null) {
+		if (dbWorkflow === null) {
 			throw new NotFoundError(`Could not find workflow with id "${webhook.workflowId}"`);
 		}
+
+		// Resolve active version
+		const workflowData = await this.workflowService.getActiveVersion(dbWorkflow);
 
 		const workflow = new Workflow({
 			id: webhook.workflowId,
@@ -114,7 +125,7 @@ export class LiveWebhooks implements IWebhookManager {
 			settings: workflowData.settings,
 		});
 
-		const ownerProjectId = workflowData.shared.find((share) => share.role === 'workflow:owner')
+		const ownerProjectId = dbWorkflow.shared.find((share) => share.role === 'workflow:owner')
 			?.project.id;
 		const additionalData = await WorkflowExecuteAdditionalData.getBase({
 			projectId: ownerProjectId,

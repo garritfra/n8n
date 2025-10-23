@@ -308,7 +308,8 @@ export = {
 
 			if (workflow.active) {
 				try {
-					await workflowManager.add(workflow.id, 'update');
+					// Re-activate the workflow with its active version
+					await workflowManager.add(workflow.id, 'update', workflow);
 				} catch (error) {
 					if (error instanceof Error) {
 						return res.status(400).json({ message: error.message });
@@ -341,6 +342,7 @@ export = {
 		projectScope('workflow:update', 'workflow'),
 		async (req: WorkflowRequest.Activate, res: express.Response): Promise<express.Response> => {
 			const { id } = req.params;
+			const { versionId } = req.body;
 
 			const workflow = await Container.get(WorkflowFinderService).findWorkflowForUser(
 				id,
@@ -355,16 +357,22 @@ export = {
 			}
 
 			if (!workflow.active) {
+				// If versionId is provided, set it as activeVersionId, otherwise use current versionId
+				const activeVersionId = versionId ?? workflow.versionId;
+
+				// FIRST: Set activeVersionId in the database
+				await setWorkflowAsActive(workflow.id, activeVersionId);
+
+				// THEN: Activate (will read activeVersionId from DB)
 				try {
 					await Container.get(ActiveWorkflowManager).add(workflow.id, 'activate');
 				} catch (error) {
 					if (error instanceof Error) {
+						// Rollback the database change
+						await setWorkflowAsInactive(workflow.id);
 						return res.status(400).json({ message: error.message });
 					}
 				}
-
-				// change the status to active in the DB
-				await setWorkflowAsActive(workflow.id);
 
 				workflow.active = true;
 
